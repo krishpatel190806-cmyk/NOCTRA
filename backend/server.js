@@ -4,6 +4,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 dotenv.config();
 const app = express();
@@ -13,7 +14,9 @@ app.use(express.json());
 const User = mongoose.model('User', new mongoose.Schema({
   name: String, email: { type: String, unique: true }, passwordHash: String, phone: String,
   role: { type: String, enum: ['user','responder','admin'], default: 'user' },
-  roles: { type: [String], enum: ['user','responder','admin'], default: ['user'] }
+  roles: { type: [String], enum: ['user','responder','admin'], default: ['user'] },
+  responderCode: { type: String, unique: true, sparse: true },
+  responderEnabledAt: Date
 }, { timestamps: true }));
 
 const Contact = mongoose.model('Contact', new mongoose.Schema({
@@ -71,17 +74,26 @@ app.post('/api/auth/login',async(req,res)=>{
 });
 app.get('/api/auth/me',auth,async(req,res)=>{const u=await User.findById(req.user.id).select('-passwordHash');if(!u)return res.status(404).json({message:'User not found'});const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);res.json({user:{...u.toObject(),role:req.user.role,roles}})});
 app.post('/api/auth/switch-role',auth,async(req,res)=>{
-  const requested=req.body.role==='responder'?'responder':'user';
-  const u=await User.findById(req.user.id); if(!u)return res.status(404).json({message:'User not found'});
-  const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
-  if(requested==='responder'&&!roles.includes('responder')){
-    if(safe(req.body.verificationCode)!==(process.env.RESPONDER_INVITE_CODE||'NOCTRA-RESPONDER'))return res.status(403).json({message:'Invalid responder verification code'});
-    roles.push('responder');
-  }
-  if(!roles.includes(requested))return res.status(403).json({message:'This role is not enabled for the account'});
-  u.roles=roles; u.role=requested; await u.save();
-  const token=jwt.sign({id:u._id,role:requested,roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
-  res.json({token,user:{id:u._id,name:u.name,email:u.email,role:requested,roles}});
+  try {
+    const requested=req.body.role==='responder'?'responder':'user';
+    const u=await User.findById(req.user.id); if(!u)return res.status(404).json({message:'User not found'});
+    const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
+    let responderCode=null;
+    if(requested==='responder'){
+      if(!roles.includes('responder')) roles.push('responder');
+      if(!u.responderCode){
+        let candidate;
+        do { candidate='NOCTRA-'+crypto.randomBytes(4).toString('hex').toUpperCase(); } while(await User.exists({responderCode:candidate}));
+        u.responderCode=candidate;
+        u.responderEnabledAt=new Date();
+        responderCode=candidate;
+      }
+    }
+    if(!roles.includes(requested))return res.status(403).json({message:'This role is not enabled for the account'});
+    u.roles=roles; u.role=requested; await u.save();
+    const token=jwt.sign({id:u._id,role:requested,roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+    res.json({token,user:{id:u._id,name:u.name,email:u.email,role:requested,roles},responderCode});
+  } catch(e) { res.status(500).json({message:'Could not switch role'}); }
 });
 
 app.get('/api/contacts',auth,role('user'),async(req,res)=>res.json({contacts:await Contact.find({userId:req.user.id}).sort({priority:1})}));
