@@ -12,7 +12,8 @@ app.use(express.json());
 
 const User = mongoose.model('User', new mongoose.Schema({
   name: String, email: { type: String, unique: true }, passwordHash: String, phone: String,
-  role: { type: String, enum: ['user','responder','admin'], default: 'user' }
+  role: { type: String, enum: ['user','responder','admin'], default: 'user' },
+  roles: { type: [String], enum: ['user','responder','admin'], default: ['user'] }
 }, { timestamps: true }));
 
 const Contact = mongoose.model('Contact', new mongoose.Schema({
@@ -51,9 +52,10 @@ app.post('/api/auth/register',async(req,res)=>{
     if(requested==='responder' && safe(verificationCode)!==(process.env.RESPONDER_INVITE_CODE||'NOCTRA-RESPONDER')) return res.status(403).json({message:'Invalid responder verification code'});
     const normalized=safe(email).toLowerCase();
     if(await User.findOne({email:normalized})) return res.status(409).json({message:'Email already registered'});
-    const u=await User.create({name:safe(name),email:normalized,phone:safe(phone),passwordHash:await bcrypt.hash(password,10),role:requested});
-    const token=jwt.sign({id:u._id,role:u.role,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
-    res.status(201).json({token,user:{id:u._id,name:u.name,email:u.email,role:u.role}});
+    const roles=requested==='responder'?['user','responder']:['user'];
+    const u=await User.create({name:safe(name),email:normalized,phone:safe(phone),passwordHash:await bcrypt.hash(password,10),role:'user',roles});
+    const token=jwt.sign({id:u._id,role:'user',roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+    res.status(201).json({token,user:{id:u._id,name:u.name,email:u.email,role:'user',roles}});
   } catch { res.status(500).json({message:'Registration failed'}); }
 });
 
@@ -61,11 +63,26 @@ app.post('/api/auth/login',async(req,res)=>{
   try {
     const u=await User.findOne({email:safe(req.body.email).toLowerCase()});
     if(!u||!(await bcrypt.compare(req.body.password||'',u.passwordHash))) return res.status(401).json({message:'Invalid email or password'});
-    const token=jwt.sign({id:u._id,role:u.role,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
-    res.json({token,user:{id:u._id,name:u.name,email:u.email,role:u.role}});
+    const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
+    const activeRole=u.role||'user';
+    const token=jwt.sign({id:u._id,role:activeRole,roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+    res.json({token,user:{id:u._id,name:u.name,email:u.email,role:activeRole,roles}});
   } catch { res.status(500).json({message:'Login failed'}); }
 });
-app.get('/api/auth/me',auth,async(req,res)=>res.json({user:await User.findById(req.user.id).select('-passwordHash')}));
+app.get('/api/auth/me',auth,async(req,res)=>{const u=await User.findById(req.user.id).select('-passwordHash');if(!u)return res.status(404).json({message:'User not found'});const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);res.json({user:{...u.toObject(),role:req.user.role,roles}})});
+app.post('/api/auth/switch-role',auth,async(req,res)=>{
+  const requested=req.body.role==='responder'?'responder':'user';
+  const u=await User.findById(req.user.id); if(!u)return res.status(404).json({message:'User not found'});
+  const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
+  if(requested==='responder'&&!roles.includes('responder')){
+    if(safe(req.body.verificationCode)!==(process.env.RESPONDER_INVITE_CODE||'NOCTRA-RESPONDER'))return res.status(403).json({message:'Invalid responder verification code'});
+    roles.push('responder');
+  }
+  if(!roles.includes(requested))return res.status(403).json({message:'This role is not enabled for the account'});
+  u.roles=roles; u.role=requested; await u.save();
+  const token=jwt.sign({id:u._id,role:requested,roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+  res.json({token,user:{id:u._id,name:u.name,email:u.email,role:requested,roles}});
+});
 
 app.get('/api/contacts',auth,role('user'),async(req,res)=>res.json({contacts:await Contact.find({userId:req.user.id}).sort({priority:1})}));
 app.post('/api/contacts',auth,role('user'),async(req,res)=>{
@@ -76,7 +93,7 @@ app.post('/api/contacts',auth,role('user'),async(req,res)=>{
 app.delete('/api/contacts/:id',auth,role('user'),async(req,res)=>{await Contact.deleteOne({_id:req.params.id,userId:req.user.id});res.json({message:'Deleted'});});
 
 const notifyResponders = async (incident, title='Emergency alert') => {
-  const responders=await User.find({role:'responder'}).select('_id');
+  const responders=await User.find({$or:[{roles:'responder'},{role:'responder'}]}).select('_id');
   if(responders.length) await Notification.insertMany(responders.map(r=>({userId:r._id,incidentId:incident._id,title,message:`${incident.incidentNumber} requires attention. Open the Responder Portal to acknowledge it.`,type:'responder_alert'})));
 };
 const createIncident=async(req,forceSOS=false)=>{
@@ -132,6 +149,13 @@ app.put('/api/incidents/:id',auth,role('user'),async(req,res)=>{
   await Notification.create({userId:i.userId,incidentId:i._id,title:'Incident cancelled',message:`${i.incidentNumber} was cancelled by the user.`,type:'status'});
   res.json({incident:i});
 });
+app.put('/api/incidents/:id/location',auth,role('user'),async(req,res)=>{
+  const lat=Number(req.body.latitude),lon=Number(req.body.longitude);
+  if(!Number.isFinite(lat)||!Number.isFinite(lon))return res.status(400).json({message:'Valid latitude and longitude are required'});
+  const i=await Incident.findOne({_id:req.params.id,userId:req.user.id});if(!i)return res.status(404).json({message:'Incident not found'});
+  if(!['Active','Responding'].includes(i.status))return res.status(400).json({message:'Location tracking is closed for this incident'});
+  i.latitude=lat;i.longitude=lon;i.locationLabel=`Live GPS · ±${Math.round(Number(req.body.accuracy)||0)} m`;await i.save();res.json({incident:i});
+});
 app.get('/api/notifications',auth,async(req,res)=>res.json({notifications:await Notification.find({userId:req.user.id}).sort({createdAt:-1})}));
 
 // Responder portal: active incidents are visible to responder accounts for the demo response workflow.
@@ -164,7 +188,7 @@ app.get('/api/contact-alerts',auth,async(req,res)=>{
   res.json({notifications});
 });
 
-app.get('/api/admin/dashboard',auth,role('admin'),async(req,res)=>{const [users,total,active,resolved]=await Promise.all([User.countDocuments({role:'user'}),Incident.countDocuments(),Incident.countDocuments({status:{$in:['Active','Responding']}}),Incident.countDocuments({status:'Resolved'})]);res.json({users,total,active,resolved})});
+app.get('/api/admin/dashboard',auth,role('admin'),async(req,res)=>{const [users,total,active,resolved]=await Promise.all([User.countDocuments({$or:[{roles:'user'},{role:'user'}]}),Incident.countDocuments(),Incident.countDocuments({status:{$in:['Active','Responding']}}),Incident.countDocuments({status:'Resolved'})]);res.json({users,total,active,resolved})});
 app.get('/api/admin/incidents',auth,role('admin'),async(req,res)=>res.json({incidents:await Incident.find().sort({createdAt:-1})}));
 app.put('/api/admin/incidents/:id',auth,role('admin'),async(req,res)=>{const i=await Incident.findById(req.params.id);if(!i)return res.status(404).json({message:'Incident not found'});if(!['Active','Responding','Resolved','Cancelled'].includes(req.body.status))return res.status(400).json({message:'Invalid status'});i.status=req.body.status;if(i.status==='Resolved')i.resolvedAt=new Date();i.activities.push({action:`Admin changed status to ${i.status}`,actorName:req.user.name||'Admin',actorRole:'admin'});await i.save();await Notification.create({userId:i.userId,incidentId:i._id,title:'Incident status updated',message:`${i.incidentNumber} is now ${i.status}.`,type:'status'});res.json({incident:i})});
 
