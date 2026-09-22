@@ -73,26 +73,47 @@ app.post('/api/auth/login',async(req,res)=>{
   } catch { res.status(500).json({message:'Login failed'}); }
 });
 app.get('/api/auth/me',auth,async(req,res)=>{const u=await User.findById(req.user.id).select('-passwordHash');if(!u)return res.status(404).json({message:'User not found'});const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);res.json({user:{...u.toObject(),role:req.user.role,roles}})});
+app.get('/api/auth/responder-code',auth,async(req,res)=>{
+  try {
+    const u=await User.findById(req.user.id);
+    if(!u)return res.status(404).json({message:'User not found'});
+    let roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
+    if(!roles.includes('responder')) roles=[...new Set([...roles,'responder'])];
+    if(!u.responderCode){
+      let candidate;
+      do { candidate='NOCTRA-'+crypto.randomBytes(4).toString('hex').toUpperCase(); } while(await User.exists({responderCode:candidate}));
+      u.responderCode=candidate;
+      u.responderEnabledAt=new Date();
+      u.roles=roles;
+      await u.save();
+    }
+    res.json({success:true,responderCode:u.responderCode});
+  } catch(e) { res.status(500).json({message:'Could not load responder verification code'}); }
+});
+
+app.post('/api/auth/verify-responder',auth,async(req,res)=>{
+  try {
+    const u=await User.findById(req.user.id);
+    if(!u)return res.status(404).json({message:'User not found'});
+    if(!u.responderCode || safe(req.body.verificationCode).toUpperCase()!==safe(u.responderCode).toUpperCase()) return res.status(403).json({message:'Invalid verification code. Please enter your unique responder code.'});
+    const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:['user','responder'];
+    if(!roles.includes('responder')) roles.push('responder');
+    u.roles=[...new Set(roles)]; u.role='responder'; await u.save();
+    const token=jwt.sign({id:u._id,role:'responder',roles:u.roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+    res.json({success:true,token,user:{id:u._id,name:u.name,email:u.email,role:'responder',roles:u.roles}});
+  } catch(e) { res.status(500).json({message:'Could not verify responder access'}); }
+});
+
 app.post('/api/auth/switch-role',auth,async(req,res)=>{
   try {
     const requested=req.body.role==='responder'?'responder':'user';
+    if(requested==='responder') return res.status(400).json({message:'Responder mode requires verification. Use the responder verification flow.'});
     const u=await User.findById(req.user.id); if(!u)return res.status(404).json({message:'User not found'});
     const roles=(Array.isArray(u.roles)&&u.roles.length)?u.roles:(u.role==='responder'?['user','responder']:[u.role||'user']);
-    let responderCode=null;
-    if(requested==='responder'){
-      if(!roles.includes('responder')) roles.push('responder');
-      if(!u.responderCode){
-        let candidate;
-        do { candidate='NOCTRA-'+crypto.randomBytes(4).toString('hex').toUpperCase(); } while(await User.exists({responderCode:candidate}));
-        u.responderCode=candidate;
-        u.responderEnabledAt=new Date();
-        responderCode=candidate;
-      }
-    }
-    if(!roles.includes(requested))return res.status(403).json({message:'This role is not enabled for the account'});
-    u.roles=roles; u.role=requested; await u.save();
-    const token=jwt.sign({id:u._id,role:requested,roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
-    res.json({token,user:{id:u._id,name:u.name,email:u.email,role:requested,roles},responderCode});
+    if(!roles.includes('user')) roles.push('user');
+    u.roles=roles; u.role='user'; await u.save();
+    const token=jwt.sign({id:u._id,role:'user',roles,name:u.name},process.env.JWT_SECRET,{expiresIn:'4h'});
+    res.json({token,user:{id:u._id,name:u.name,email:u.email,role:'user',roles}});
   } catch(e) { res.status(500).json({message:'Could not switch role'}); }
 });
 
